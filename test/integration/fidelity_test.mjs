@@ -203,6 +203,7 @@ async function generateCliDump(packageDir, name) {
         moveLockAfter,
         "utf-8"
       );
+      await fs.writeFile(moveLockPath, moveLockBefore, "utf-8");
     }
 
     if (result.error) {

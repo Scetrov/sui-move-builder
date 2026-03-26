@@ -320,7 +320,7 @@ npm run test:lite   # Run fidelity tests (lite version)
 npm test            # Run full integration tests
 ```
 
-**Test Cases (verified against sui-mainnet-v1.63.3):**
+**Test Cases (verified against sui-mainnet-v1.67.1):**
 
 | Package     | Modules | Dependencies | Digest | Lockfile               |
 | ----------- | ------- | ------------ | ------ | ---------------------- |

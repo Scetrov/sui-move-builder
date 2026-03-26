@@ -264,7 +264,7 @@ Result A == Result B  →  WASM ≡ Rust
 ✅ deepbook:  Modules ✅, Dependencies ✅, Digest ✅, Lockfile ✅ (mainnet + testnet)
 ✅ deeptrade: Modules ✅, Dependencies ✅, Digest ✅, Lockfile ✅ (diamond deps)
 
-📊 Verified against sui-mainnet-v1.63.3 CLI
+📊 Verified against sui-mainnet-v1.67.1 CLI
 ```
 
 ---
@@ -393,8 +393,8 @@ linkageTable.set(originalId, { depth, idx: index });
 | Component     | Source                                          |
 | ------------- | ----------------------------------------------- |
 | Sui Version   | `sui-version.json` (shared config)              |
-| Reference CLI | sui-mainnet-v1.63.3                             |
-| Test Fixtures | `test/integration/fixtures/sui-mainnet-v1.63.3` |
+| Reference CLI | sui-mainnet-v1.67.1                             |
+| Test Fixtures | `test/integration/fixtures/sui-mainnet-v1.67.1` |
 
 ### Shared Configuration
 
@@ -402,8 +402,8 @@ linkageTable.set(originalId, { depth, idx: index });
 
 ```json
 {
-  "version": "1.63.3",
-  "commit": "04dd28d5c5d92bff685ddfecb86f8acce18ce6df",
+  "version": "1.67.1",
+  "commit": "4e8aa9ee8b307b294cc85baf7d08af1f432e3d93",
   "tag": "framework/mainnet"
 }
 ```

@@ -7,20 +7,27 @@ use move_compiler::{Compiler, Flags, editions::{Flavor, Edition}, shared::{Numer
 use move_core_types::{account_address::AccountAddress, language_storage::ModuleId};
 use move_symbol_pool::Symbol;
 #[cfg(feature = "testing")]
-use move_unit_test::{UnitTestingConfig, extensions::set_extension_hook};
+use move_unit_test::{UnitTestingConfig, vm_test_setup::VMTestSetup};
 #[cfg(feature = "testing")]
-use move_vm_runtime::native_extensions::NativeContextExtensions;
-use once_cell::sync::Lazy;
+use move_vm_config::runtime::VMConfig;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "testing")]
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+#[cfg(feature = "testing")]
+use std::ops::{Deref, DerefMut};
+#[cfg(feature = "testing")]
 use std::rc::Rc;
+#[cfg(feature = "testing")]
 use std::sync::Arc;
+#[cfg(feature = "testing")]
+use sui_adapter::gas_meter::SuiGasMeter;
 use sui_protocol_config::ProtocolConfig;
 use sui_types::{
     base_types::{SuiAddress, TxContext},
     digests::TransactionDigest,
-    gas_model::tables::initial_cost_schedule_for_unit_tests,
+    gas::{SuiGasStatus, SuiGasStatusAPI},
+    gas_model::{tables::GasStatus, units_types::Gas},
     in_memory_storage::InMemoryStorage,
     metrics::LimitsMetrics,
 };
@@ -190,8 +197,13 @@ fn fn_info(units: &[AnnotatedCompiledModule]) -> FnInfoMap {
 fn verify_bytecode(units: &[AnnotatedCompiledModule], fn_info: &FnInfoMap, test_mode: bool) -> Result<(), String> {
     let verifier_config = ProtocolConfig::get_for_version(ProtocolVersion::MAX, Chain::Unknown)
         .verifier_config(/* signing_limits */ None);
+    let root_package_name = Symbol::from("root");
 
     for unit in units {
+        if unit.package_name() != Some(root_package_name) {
+            continue;
+        }
+
         let m = &unit.named_module.module;
         move_bytecode_verifier::verify_module_unmetered(m).map_err(|err| {
              format!("Module Verification Failure: {}", err)
@@ -258,52 +270,131 @@ impl MoveTestResult {
     }
 }
 
-// Create a separate test store per-thread (though Wasm is usually single-threaded).
 #[cfg(feature = "testing")]
-thread_local! {
-    static TEST_STORE_INNER: RefCell<InMemoryStorage> = RefCell::new(InMemoryStorage::default());
+const TEST_GAS_PRICE: u64 = 500;
+
+#[cfg(feature = "testing")]
+pub struct SuiWasmVMTestSetup {
+    gas_price: u64,
+    reference_gas_price: u64,
+    protocol_config: ProtocolConfig,
+    native_function_table: move_vm_runtime::native_functions::NativeFunctionTable,
 }
 
 #[cfg(feature = "testing")]
-static TEST_STORE: Lazy<sui_move_natives::test_scenario::InMemoryTestStore> = Lazy::new(|| {
-    sui_move_natives::test_scenario::InMemoryTestStore(&TEST_STORE_INNER)
-});
+impl Default for SuiWasmVMTestSetup {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[cfg(feature = "testing")]
-static SET_EXTENSION_HOOK: Lazy<()> =
-    Lazy::new(|| set_extension_hook(Box::new(new_testing_object_and_natives_cost_runtime)));
+impl SuiWasmVMTestSetup {
+    pub fn new() -> Self {
+        let protocol_config = ProtocolConfig::get_for_max_version_UNSAFE();
+        let native_function_table =
+            sui_move_natives::all_natives(false, &protocol_config);
+        Self {
+            gas_price: TEST_GAS_PRICE,
+            reference_gas_price: TEST_GAS_PRICE,
+            protocol_config,
+            native_function_table,
+        }
+    }
+}
 
 #[cfg(feature = "testing")]
-fn new_testing_object_and_natives_cost_runtime(ext: &mut NativeContextExtensions) {
-    let registry = prometheus::Registry::new();
-    let metrics = Arc::new(LimitsMetrics::new(&registry));
-    let store = Lazy::force(&TEST_STORE);
-    let protocol_config = ProtocolConfig::get_for_max_version_UNSAFE();
+impl VMTestSetup for SuiWasmVMTestSetup {
+    type Meter<'a> = SuiGasMeter<SuiGasStatusTestWrapper>;
+    type ExtensionsBuilder<'a> = sui_move_natives::test_scenario::InMemoryTestStore;
 
-    ext.add(sui_move_natives::object_runtime::ObjectRuntime::new(
-        store,
-        BTreeMap::new(),
-        false,
-        Box::leak(Box::new(ProtocolConfig::get_for_max_version_UNSAFE())),
-        metrics,
-        0,
-    ));
-    ext.add(sui_move_natives::NativesCostTable::from_protocol_config(&protocol_config));
-    let tx_context = TxContext::new_from_components(
-        &SuiAddress::ZERO,
-        &TransactionDigest::default(),
-        &0,
-        0,
-        0,
-        0,
-        0,
-        None,
-        &protocol_config,
-    );
-    ext.add(sui_move_natives::transaction_context::TransactionContext::new_for_testing(Rc::new(RefCell::new(
-        tx_context,
-    ))));
-    ext.add(store);
+    fn new_meter<'a>(&'a self, execution_bound: Option<u64>) -> Self::Meter<'a> {
+        SuiGasMeter(SuiGasStatusTestWrapper(
+            SuiGasStatus::new(
+                execution_bound.unwrap_or(self.protocol_config.max_tx_gas()),
+                self.gas_price,
+                self.reference_gas_price,
+                &self.protocol_config,
+            )
+            .unwrap(),
+        ))
+    }
+
+    fn used_gas<'a>(&'a self, execution_bound: u64, meter: Self::Meter<'a>) -> u64 {
+        let gas_status = &meter.0;
+        Gas::new(execution_bound)
+            .checked_sub(gas_status.remaining_gas())
+            .unwrap()
+            .into()
+    }
+
+    fn vm_config(&self) -> VMConfig {
+        sui_adapter::adapter::vm_config(&self.protocol_config)
+    }
+
+    fn native_function_table(&self) -> move_vm_runtime::native_functions::NativeFunctionTable {
+        self.native_function_table.clone()
+    }
+
+    fn new_extensions_builder(&self) -> sui_move_natives::test_scenario::InMemoryTestStore {
+        sui_move_natives::test_scenario::InMemoryTestStore(RefCell::new(InMemoryStorage::default()))
+    }
+
+    fn new_native_context_extensions<'ext>(
+        &self,
+        store: &'ext sui_move_natives::test_scenario::InMemoryTestStore,
+    ) -> move_vm_runtime::native_extensions::NativeContextExtensions<'ext> {
+        let mut ext = move_vm_runtime::native_extensions::NativeContextExtensions::default();
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(LimitsMetrics::new(&registry));
+
+        ext.add(sui_move_natives::object_runtime::ObjectRuntime::new(
+            store,
+            BTreeMap::new(),
+            false,
+            Box::leak(Box::new(ProtocolConfig::get_for_max_version_UNSAFE())),
+            metrics,
+            0,
+        ));
+        ext.add(sui_move_natives::NativesCostTable::from_protocol_config(
+            &self.protocol_config,
+        ));
+        let tx_context = TxContext::new_from_components(
+            &SuiAddress::ZERO,
+            &TransactionDigest::default(),
+            &0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            &self.protocol_config,
+        );
+        ext.add(sui_move_natives::transaction_context::TransactionContext::new_for_testing(
+            Rc::new(RefCell::new(tx_context)),
+        ));
+        ext.add(store);
+        ext
+    }
+}
+
+#[cfg(feature = "testing")]
+pub struct SuiGasStatusTestWrapper(SuiGasStatus);
+
+#[cfg(feature = "testing")]
+impl Deref for SuiGasStatusTestWrapper {
+    type Target = GasStatus;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.move_gas_status()
+    }
+}
+
+#[cfg(feature = "testing")]
+impl DerefMut for SuiGasStatusTestWrapper {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.move_gas_status_mut()
+    }
 }
 
 fn setup_vfs(
@@ -1193,9 +1284,6 @@ fn test_impl(
         },
     };
 
-    // 4. Run tests and capture output
-    Lazy::force(&SET_EXTENSION_HOOK);
-
     let config = UnitTestingConfig {
         num_threads: 1, // Crucial for Wasm
         gas_limit: Some(1_000_000),
@@ -1203,16 +1291,10 @@ fn test_impl(
         ..UnitTestingConfig::default_with_bound(None)
     };
 
-    let natives = sui_move_natives::all_natives(
-        false,
-        &ProtocolConfig::get_for_max_version_UNSAFE(),
-    );
-
     let output_buffer = std::io::Cursor::new(Vec::new());
     let (output_buffer, passed) = match config.run_and_report_unit_tests(
         test_plan,
-        Some(natives),
-        Some(initial_cost_schedule_for_unit_tests()),
+        SuiWasmVMTestSetup::new(),
         output_buffer,
     ) {
         Ok(res) => res,

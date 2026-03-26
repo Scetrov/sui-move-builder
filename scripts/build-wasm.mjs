@@ -16,6 +16,11 @@ const cloneDir = path.join(repoRoot, "sui");
 const localSourceDir = path.join(repoRoot, "sui-move-wasm");
 const SUI_COMMIT = suiVersion.commit; // Loaded from sui-version.json
 const SUI_VERSION_TAG = `v${suiVersion.version}`;
+const WASM_BINDGEN_CLI_VERSION = "0.2.114";
+
+function versionStubSuffix(version) {
+  return version.replace(/[.+]/g, "");
+}
 
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -184,21 +189,21 @@ async function main() {
 
       // Patch zstd and zstd-sys to remove default features (ASM)
       workspaceContent = workspaceContent.replace(
-        /zstd = "(0\.[0-9.]+)"/g,
-        'zstd = { version = "$1", default-features = false, features = ["no_asm"] }'
+        /zstd = "(0\.[0-9.+a-z]+)"/g,
+        `zstd = { version = "${buildConfig.versions.zstd}", default-features = false, features = ["no_asm"] }`
       );
       workspaceContent = workspaceContent.replace(
-        /zstd-safe = "(0\.[0-9.]+)"/g,
-        'zstd-safe = { version = "$1", default-features = false, features = ["no_asm"] }'
+        /zstd-safe = "(0\.[0-9.+a-z-]+)"/g,
+        `zstd-safe = { version = "${buildConfig.versions.zstd_safe}", default-features = false, features = ["no_asm"] }`
       );
       workspaceContent = workspaceContent.replace(
-        /zstd-sys = "(2\.[0-9.]+)"/g,
+        /zstd-sys = "(2\.[0-9.+a-z-]+)"/g,
         `zstd-sys = { version = "${buildConfig.versions.zstd_sys}", default-features = false, features = ["no_asm"] }`
       );
       // Fallback for different version formats or existing objects
       workspaceContent = workspaceContent.replace(
-        /zstd-sys = { version = "(2\.[0-9.]+)"/g,
-        'zstd-sys = { version = "$1", default-features = false, features = ["no_asm"] }'
+        /zstd-sys = { version = "(2\.[0-9.+a-z-]+)"/g,
+        `zstd-sys = { version = "${buildConfig.versions.zstd_sys}", default-features = false, features = ["no_asm"] }`
       );
       // Force tokio time feature globally
       workspaceContent = workspaceContent.replace(
@@ -235,11 +240,11 @@ async function main() {
         `rand = "=${buildConfig.versions.rand}"`
       );
       workspaceContent = workspaceContent.replace(
-        /fastcrypto = { git = "https:\/\/github\.com\/MystenLabs\/fastcrypto", rev = "4db0e90c732bbf7420ca20de808b698883148d9c" }/g,
+        /fastcrypto = { git = "https:\/\/github\.com\/MystenLabs\/fastcrypto", rev = "[0-9a-f]+"(?:, [^}]*)? }/g,
         `fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "${buildConfig.versions.fastcrypto.rev}", default-features = false }`
       );
       workspaceContent = workspaceContent.replace(
-        /sui-crypto = { git = "https:\/\/github\.com\/MystenLabs\/sui-rust-sdk\.git", rev = "339c2272fd5b8fb4e1fa6662cfa9acdbb0d05704", features = \[ "ed25519", "secp256r1", "secp256k1", "passkey", "zklogin" \] }/g,
+        /sui-crypto = { git = "https:\/\/github\.com\/MystenLabs\/sui-rust-sdk\.git", rev = "[0-9a-f]+"(?:, [^}]*)? }/g,
         `sui-crypto = { git = "https://github.com/MystenLabs/sui-rust-sdk.git", rev = "${buildConfig.versions.sui_crypto.rev}", features = [ "ed25519", "secp256r1", "passkey", "zklogin" ] }`
       );
       workspaceContent = workspaceContent.replace(
@@ -306,7 +311,7 @@ async function main() {
             (v) =>
               `ring_v${v.replace(/\./g, "")} = { package = "ring", version = "=${v}", path = "${path.join(rootAbsPath, "scripts", "stubs", "ring" + v.replace(/\./g, "") + "-stub")}" }`
           ),
-        ...["0.11.2+zstd.1.5.2", "0.12.3", "0.13.3"].map(
+        ...["0.11.2+zstd.1.5.2", buildConfig.versions.zstd, "0.13.3"].map(
           (v) =>
             `zstd_v${v.replace(/[.+]/g, "")} = { package = "zstd", version = "=${v}", path = "${path.join(rootAbsPath, "scripts", "stubs", "zstd" + v.replace(/[.+]/g, "") + "-stub")}" }`
         ),
@@ -331,7 +336,7 @@ async function main() {
         { length: 11 },
         (_, i) => `0.2.${i + 10}`
       ).concat(["0.1.16", "0.3.4"]);
-      const zstdVers = ["0.11.2+zstd.1.5.2", "0.12.3", "0.13.3"];
+      const zstdVers = ["0.11.2+zstd.1.5.2", buildConfig.versions.zstd, "0.13.3"];
 
       // Templates loaded above
 
@@ -911,6 +916,30 @@ panic = "abort"
       }
     }
 
+    const fullCheckpointContent = path.join(
+      cloneDir,
+      "crates",
+      "sui-types",
+      "src",
+      "full_checkpoint_content.rs"
+    );
+    if (await fs.stat(fullCheckpointContent).catch(() => false)) {
+      let content = await fs.readFile(fullCheckpointContent, "utf-8");
+      if (
+        content.includes("pub fn proto_field_mask() -> sui_rpc::field::FieldMask") &&
+        !content.includes("#[cfg(not(target_arch = \"wasm32\"))]\n    pub fn proto_field_mask")
+      ) {
+        console.log(
+          "Gating full_checkpoint_content::proto_field_mask() off for wasm32..."
+        );
+        content = content.replace(
+          "    pub fn proto_field_mask() -> sui_rpc::field::FieldMask {",
+          "    #[cfg(not(target_arch = \"wasm32\"))]\n    pub fn proto_field_mask() -> sui_rpc::field::FieldMask {"
+        );
+        await fs.writeFile(fullCheckpointContent, content);
+      }
+    }
+
     // 4.3 Patch move-unit-test to DISABLE THREADING (Wasm crash fix)
     const moveUnitTestRunner = path.join(
       cloneDir,
@@ -937,7 +966,7 @@ panic = "abort"
       `  Target exists: ${!!targetExists}, Source exists: ${!!sourceExists}`
     );
 
-    if (targetExists && sourceExists) {
+    if (targetExists && sourceExists && SUI_VERSION_TAG !== "v1.67.1") {
       console.log(
         "Forcibly overwriting move-unit-test/src/test_runner.rs with patched version..."
       );
@@ -948,6 +977,10 @@ panic = "abort"
       } else {
         console.log("WARNING: test_runner.rs does NOT contain debug prints!");
       }
+    } else if (targetExists && sourceExists) {
+      console.log(
+        `Skipping move-unit-test runner overwrite for ${SUI_VERSION_TAG}; using upstream file.`
+      );
     } else {
       console.log(
         "WARNING: Could not patch test_runner.rs (File not found or stub missing)"
@@ -1250,9 +1283,24 @@ panic = "abort"
               "stubs",
               "secp256k1-sys-stub"
             ),
-            errno: path.join(repoRoot, "scripts", "stubs", "errno0314-stub"),
-            zstd: path.join(repoRoot, "scripts", "stubs", "zstd0123-stub"),
-            ring: path.join(repoRoot, "scripts", "stubs", "ring01714-stub"),
+            errno: path.join(
+              repoRoot,
+              "scripts",
+              "stubs",
+              `errno${versionStubSuffix(buildConfig.versions.errno)}-stub`
+            ),
+            zstd: path.join(
+              repoRoot,
+              "scripts",
+              "stubs",
+              `zstd${versionStubSuffix(buildConfig.versions.zstd)}-stub`
+            ),
+            ring: path.join(
+              repoRoot,
+              "scripts",
+              "stubs",
+              `ring${versionStubSuffix(buildConfig.versions.ring)}-stub`
+            ),
             stacker: path.join(
               repoRoot,
               "scripts",
@@ -1264,7 +1312,7 @@ panic = "abort"
               repoRoot,
               "scripts",
               "stubs",
-              "getrandom0217-stub"
+              `getrandom${versionStubSuffix(buildConfig.versions.getrandom)}-stub`
             ),
           };
           for (const [name, stubPath] of Object.entries(stubs)) {
@@ -1309,7 +1357,7 @@ panic = "abort"
             if (regex.test(content)) {
               content = content.replace(regex, (match) => {
                 const isOptional = match.includes("optional = true");
-                return `tokio = { version = "=1.47.1", default-features = false, features = ["sync", "macros", "rt", "io-util", "time"]${isOptional ? ", optional = true" : ""} }`;
+                return `tokio = { version = "=${buildConfig.versions.tokio}", default-features = false, features = ["sync", "macros", "rt", "io-util", "time"]${isOptional ? ", optional = true" : ""} }`;
               });
               changed = true;
             }
@@ -1323,8 +1371,7 @@ panic = "abort"
             if (regex.test(content)) {
               content = content.replace(regex, (match) => {
                 const isOptional = match.includes("optional = true");
-                // Assuming version 0.12.9 from lockfile
-                return `reqwest = { version = "0.12.9", default-features = false, features = ["json", "blocking"]${isOptional ? ", optional = true" : ""} }`;
+                return `reqwest = { version = "${buildConfig.versions.reqwest}", default-features = false, features = ["json", "blocking"]${isOptional ? ", optional = true" : ""} }`;
               });
               changed = true;
             }
@@ -1420,6 +1467,7 @@ panic = "abort"
         outDir: path.join(distDir, "full"),
       },
     ];
+    let wasmBindgenReady = false;
 
     for (const profile of buildProfiles) {
       console.log(
@@ -1450,16 +1498,18 @@ panic = "abort"
       const localBin = path.join(repoRoot, "local-bin");
       const wasmBindgenCmd = path.join(localBin, "bin/wasm-bindgen");
 
-      // Install if missing (only need to check once really, but idempotent)
-      if (!(await dirExists(wasmBindgenCmd))) {
-        console.log("Installing wasm-bindgen-cli v0.2.108...");
+      // Ensure a matching wasm-bindgen CLI exactly once per build run.
+      if (!wasmBindgenReady) {
+        console.log(
+          `Installing wasm-bindgen-cli v${WASM_BINDGEN_CLI_VERSION}...`
+        );
         await run(
           "cargo",
           [
             "install",
             "wasm-bindgen-cli",
             "--version",
-            "0.2.108",
+            WASM_BINDGEN_CLI_VERSION,
             "--root",
             localBin,
             "--force",
@@ -1467,6 +1517,7 @@ panic = "abort"
           ],
           { env: process.env }
         );
+        wasmBindgenReady = true;
       }
 
       const wasmArtifact = path.join(

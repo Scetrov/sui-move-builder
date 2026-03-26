@@ -9,7 +9,7 @@ build = "build.rs"
 
 [features]
 default = []
-testing = ["dep:move-unit-test", "dep:sui-move-natives", "dep:move-vm-runtime"]
+testing = ["dep:move-unit-test", "dep:sui-adapter", "dep:sui-move-natives", "dep:move-vm-config", "dep:move-vm-runtime"]
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = false
@@ -215,8 +215,10 @@ move-symbol-pool = { path = "vendor/move/crates/move-symbol-pool" }
 move-bytecode-utils = { path = "vendor/move/crates/move-bytecode-utils" }
 move-bytecode-verifier = { path = "vendor/move/crates/move-bytecode-verifier" }
 move-unit-test = { path = "vendor/move/crates/move-unit-test", optional = true }
+move-vm-config = { path = "vendor/move/crates/move-vm-config", optional = true }
 move-vm-runtime = { path = "vendor/move/crates/move-vm-runtime", optional = true }
 move-package-alt-compilation = { path = "vendor/move/crates/move-package-alt-compilation" }
+sui-adapter = { path = "sui-execution/latest/sui-adapter", package = "sui-adapter-latest", optional = true }
 sui-move-natives = { path = "sui-execution/latest/sui-move-natives", package = "sui-move-natives-latest", optional = true }
 sui-protocol-config = { path = "crates/sui-protocol-config" }
 sui-types = { path = "crates/sui-types" }
