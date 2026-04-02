@@ -177,6 +177,7 @@ export class GitHubFetcher extends Fetcher {
         !relativePath.endsWith(".move") &&
         relativePath !== "Move.toml" &&
         relativePath !== "Move.lock" &&
+        relativePath !== "Published.toml" &&
         !relativePath.match(/^Move\.(mainnet|testnet|devnet)\.toml$/)
       ) {
         continue;
