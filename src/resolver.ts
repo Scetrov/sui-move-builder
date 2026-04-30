@@ -21,7 +21,7 @@ import { ResolvedGraph } from "./resolvedGraph.js";
 import { CompilationDependencies } from "./compilationDependencies.js";
 
 // Load from shared config (synchronized with scripts/build-wasm.mjs)
-import suiVersionConfig from "../sui-version.json" with { type: "json" };
+import suiVersionConfig from "../sui-version.json";
 
 /**
  * Default Sui framework revision for WASM builds when building without lockfile.
@@ -1417,7 +1417,7 @@ export class Resolver {
     }
 
     // Second pass: Add dependency edges
-    // ORIGINAL: builder.rs:147-178 (sui-mainnet-v1.63.3)
+    // ORIGINAL: builder.rs:147-178 (sui-mainnet-v1.67.1)
     // CLI iterates source_package.direct_deps() which INCLUDES implicit deps (std, sui)
     // injected by F::implicit_dependencies() in package_impl.rs:253-267.
     // CLI then looks up target_id from source_pin.deps (lockfile's deps mapping).

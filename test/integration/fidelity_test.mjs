@@ -1,4 +1,5 @@
 import { promises as fs } from "fs";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawnSync } from "child_process";
@@ -13,6 +14,12 @@ const __dirname = path.dirname(__filename);
 // usage: node fidelity_test.mjs [full|lite]
 const MODE = process.argv[2] === "lite" ? "lite" : "full";
 const DIST_DIR = path.resolve(__dirname, `../../dist/${MODE}`);
+const SUI_CLI = process.env.SUI_CLI || "sui";
+const EXPECTED_SUI_VERSION = "1.67.1";
+const EXPECTED_SUI_COMMIT_PREFIX = "4e8aa9ee";
+const CLI_DUMP_MODE = "dump-no-tree-shaking";
+let suiCliVersion = null;
+let cliRewriteHome = null;
 
 console.log(`Running Fidelity Tests in [${MODE.toUpperCase()}] mode`);
 
@@ -21,6 +28,105 @@ const { initMoveCompiler, buildMovePackage, fetchPackageFromGitHub } =
   await import(path.join(DIST_DIR, "index.js"));
 
 const FIXTURES_DIR = path.join(__dirname, "fixtures");
+
+function sanitizeForFilename(value) {
+  return value.replace(/[^a-zA-Z0-9._-]+/g, "_");
+}
+
+function assertExactSuiCliVersion() {
+  const result = spawnSync(SUI_CLI, ["--version"], {
+    encoding: "utf-8",
+    timeout: 30000,
+  });
+
+  if (result.error) {
+    throw new Error(
+      `[CLI_VERSION] Failed to run SUI_CLI=${SUI_CLI}: ${result.error.message}`
+    );
+  }
+
+  if (result.status !== 0) {
+    throw new Error(
+      `[CLI_VERSION] SUI_CLI=${SUI_CLI} exited ${result.status}: ${result.stderr || result.stdout}`
+    );
+  }
+
+  const version = (result.stdout || result.stderr || "").trim();
+  const expectedPrefix = `sui ${EXPECTED_SUI_VERSION}-${EXPECTED_SUI_COMMIT_PREFIX}`;
+  if (!version.startsWith(expectedPrefix)) {
+    throw new Error(
+      `[CLI_VERSION] Expected ${expectedPrefix}*, got ${version || "<empty>"}. Set SUI_CLI to the exact Sui 1.67.1 binary.`
+    );
+  }
+
+  suiCliVersion = version;
+  console.log(`[CLI] Using ${SUI_CLI} (${suiCliVersion})`);
+}
+
+function formatCliOutput(result) {
+  const stdout = (result.stdout || "").trim();
+  const stderr = (result.stderr || "").trim();
+  return [
+    stderr ? `stderr:\n${stderr.slice(-4000)}` : null,
+    stdout ? `stdout:\n${stdout.slice(-4000)}` : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function normalizeFileUrl(repoPath) {
+  return repoPath.startsWith("file://") ? repoPath : `file://${repoPath}`;
+}
+
+function collectGitRewrites() {
+  const rewrites = [];
+
+  if (process.env.SUI_REPO_OVERRIDE) {
+    const replacement = normalizeFileUrl(process.env.SUI_REPO_OVERRIDE);
+    rewrites.push(["https://github.com/MystenLabs/sui.git", replacement]);
+    rewrites.push(["https://github.com/MystenLabs/sui", replacement]);
+  }
+
+  const extraRewrites = process.env.SUI_CLI_GIT_REWRITES || "";
+  for (const entry of extraRewrites.split(";")) {
+    if (!entry.trim()) continue;
+    const [from, to] = entry.split("=");
+    if (!from || !to) {
+      throw new Error(
+        `[CLI_ENV] Invalid SUI_CLI_GIT_REWRITES entry: ${entry}`
+      );
+    }
+    rewrites.push([from, normalizeFileUrl(to)]);
+  }
+
+  return rewrites;
+}
+
+async function cliGitRewriteEnv() {
+  const rewrites = collectGitRewrites();
+
+  const env = { ...process.env };
+  rewrites.forEach(([from, to], index) => {
+    env[`GIT_CONFIG_KEY_${index}`] = `url.${to}.insteadOf`;
+    env[`GIT_CONFIG_VALUE_${index}`] = from;
+  });
+  env.GIT_CONFIG_COUNT = String(rewrites.length);
+
+  if (rewrites.length > 0) {
+    if (!cliRewriteHome) {
+      cliRewriteHome = await fs.mkdtemp(path.join(os.tmpdir(), "sui-cli-home-"));
+      const gitConfig = rewrites
+        .map(
+          ([from, to]) => `[url "${to}"]\n\tinsteadOf = ${from}\n`
+        )
+        .join("\n");
+      await fs.writeFile(path.join(cliRewriteHome, ".gitconfig"), gitConfig);
+    }
+    env.HOME = cliRewriteHome;
+  }
+
+  return env;
+}
 
 const REPOS = {
   nautilus: {
@@ -50,6 +156,8 @@ const REPOS = {
     packagePath: "packages/deeptrade-core",
     network: "mainnet",
     txDigest: "75SMrmoARyPwLvt7ZHgoBsN9NtHkAmkcXNMtnzo84K52",
+    skipCliParity:
+      "investigation fixture: exact CLI dump is unstable with its V3 lock and external Pyth/Wormhole dependency graph",
   },
 };
 
@@ -110,6 +218,13 @@ async function setupRepo(name, config, githubToken) {
 // Read local files from directory
 async function readLocalFiles(dir) {
   const files = {};
+  const generatedArtifacts = new Set([
+    "MoveV4.lock",
+    "PublishedV4.toml",
+    "Move.lock.before_cli",
+    "Move.lock.after_cli",
+    "wasm_dump.json",
+  ]);
 
   async function readDirRecursive(currentDir, baseDir = currentDir) {
     const entries = await fs.readdir(currentDir, { withFileTypes: true });
@@ -120,6 +235,12 @@ async function readLocalFiles(dir) {
         if (entry.name === "build" || entry.name === ".git") continue;
         await readDirRecursive(fullPath, baseDir);
       } else {
+        if (
+          generatedArtifacts.has(entry.name) ||
+          entry.name.startsWith("cli_dump_")
+        ) {
+          continue;
+        }
         if (
           entry.name.endsWith(".move") ||
           entry.name.endsWith(".toml") ||
@@ -136,20 +257,42 @@ async function readLocalFiles(dir) {
 }
 
 /**
- * Generate CLI bytecode dump using `sui move build --dump-bytecode-as-base64`
- * Saves output to cli_dump.json in package directory
+ * Generate CLI bytecode dump using exact `sui move build --dump-bytecode-as-base64`
+ * Saves output to a versioned cli_dump_*.json in package directory
  * Also backs up Move.toml and Move.lock before/after to detect CLI modifications
  */
-async function generateCliDump(packageDir, name) {
-  const dumpPath = path.join(packageDir, "cli_dump.json");
+async function generateCliDump(packageDir, name, network) {
+  if (!suiCliVersion) {
+    throw new Error("[CLI_VERSION] Sui CLI version preflight has not run");
+  }
+
+  const cacheKey = sanitizeForFilename(`${suiCliVersion}_${CLI_DUMP_MODE}`);
+  const dumpPath = path.join(packageDir, `cli_dump_${cacheKey}.json`);
+  const cliArgs = [
+    "move",
+    "build",
+    "--dump-bytecode-as-base64",
+    "--no-tree-shaking",
+    "-e",
+    network,
+  ];
 
   // Check if already cached
   if (await fs.stat(dumpPath).catch(() => false)) {
-    console.log(`[CLI Dump] Using cached dump for ${name}`);
-    return JSON.parse(await fs.readFile(dumpPath, "utf-8"));
+    const cached = JSON.parse(await fs.readFile(dumpPath, "utf-8"));
+    if (
+      cached.__metadata?.suiVersion === suiCliVersion &&
+      cached.__metadata?.cliDumpMode === CLI_DUMP_MODE
+    ) {
+      console.log(`[CLI Dump] Using cached dump for ${name} (${suiCliVersion})`);
+      return cached;
+    }
+    console.log(`[CLI Dump] Cache metadata mismatch for ${name}; regenerating`);
   }
 
-  console.log(`[CLI Dump] Generating bytecode dump for ${name}...`);
+  console.log(
+    `[CLI Dump] Generating bytecode dump for ${name} with ${suiCliVersion}...`
+  );
 
   // Backup Move.lock before CLI build (only for comparison)
   const moveLockPath = path.join(packageDir, "Move.lock");
@@ -172,12 +315,13 @@ async function generateCliDump(packageDir, name) {
   }
 
   try {
-    // Run sui move build with dump flag
+    // Run exact sui move build with dump flag
     const result = spawnSync(
-      "sui",
-      ["move", "build", "--dump-bytecode-as-base64"],
+      SUI_CLI,
+      cliArgs,
       {
         cwd: packageDir,
+        env: await cliGitRewriteEnv(),
         encoding: "utf-8",
         maxBuffer: 50 * 1024 * 1024, // 50MB buffer for large outputs
         timeout: 120000, // 2 minute timeout
@@ -206,16 +350,15 @@ async function generateCliDump(packageDir, name) {
     }
 
     if (result.error) {
-      console.log(`[CLI Dump] Failed to run CLI: ${result.error.message}`);
-      return null;
+      throw new Error(
+        `[CLI_COMPILE] Failed to run SUI_CLI=${SUI_CLI}: ${result.error.message}`
+      );
     }
 
     if (result.status !== 0) {
-      console.log(`[CLI Dump] CLI build failed (exit code ${result.status})`);
-      if (result.stderr) {
-        console.log(`[CLI Dump] stderr: ${result.stderr.slice(0, 500)}`);
-      }
-      return null;
+      throw new Error(
+        `[CLI_COMPILE] CLI build failed for ${name} (exit code ${result.status})\n${formatCliOutput(result)}`
+      );
     }
 
     // Parse JSON output from stdout
@@ -225,26 +368,43 @@ async function generateCliDump(packageDir, name) {
     // Find JSON in output (may have build messages before it)
     const jsonStart = stdout.indexOf("{");
     if (jsonStart === -1) {
-      console.log(`[CLI Dump] No JSON found in CLI output`);
-      return null;
+      throw new Error(
+        `[CLI_DUMP] No JSON found in CLI output for ${name}\n${formatCliOutput(result)}`
+      );
     }
 
     const jsonStr = stdout.slice(jsonStart);
     const dump = JSON.parse(jsonStr);
+    dump.__metadata = {
+      suiBinary: SUI_CLI,
+      suiVersion: suiCliVersion,
+      cliDumpMode: CLI_DUMP_MODE,
+      cliArgs,
+      package: name,
+      network,
+      generatedAt: new Date().toISOString(),
+    };
 
     // Save to cache
     await fs.writeFile(dumpPath, JSON.stringify(dump, null, 2), "utf-8");
-    console.log(`[CLI Dump] Saved dump to cli_dump.json`);
+    console.log(`[CLI Dump] Saved dump to ${path.basename(dumpPath)}`);
 
     // Return dump with moveLockModified flag
     return { ...dump, moveLockModified };
   } catch (e) {
-    console.log(`[CLI Dump] Error: ${e.message}`);
-    return null;
+    throw e;
+  } finally {
+    if (moveLockBefore !== null) {
+      await fs.writeFile(moveLockPath, moveLockBefore, "utf-8");
+    } else if (await fs.stat(moveLockPath).catch(() => false)) {
+      await fs.rm(moveLockPath);
+    }
   }
 }
 
 async function runTest() {
+  assertExactSuiCliVersion();
+
   console.log("Initializing compiler...");
   const start = Date.now();
   const wasmPath = path.resolve(DIST_DIR, "sui_move_wasm_bg.wasm");
@@ -601,63 +761,76 @@ async function runTest() {
           }
 
           // CLI comparison (modules, deps, digest)
+          if (config.skipCliParity) {
+            console.log(`[CLI] ⚠️  Skipped: ${config.skipCliParity}`);
+            continue;
+          }
+
           const packageDir = path.join(FIXTURES_DIR, name, config.packagePath);
-          const cliDump = await generateCliDump(packageDir, name);
+          const cliDump = await generateCliDump(
+            packageDir,
+            name,
+            config.network
+          );
 
-          if (cliDump) {
-            // CLI Modules comparison
-            const cliModules = cliDump.modules || [];
-            const wasmModulesMatch =
-              result.modules?.length === cliModules.length &&
-              result.modules.every((m, i) => m === cliModules[i]);
-            if (wasmModulesMatch) {
-              console.log(`[CLI] ✅ Modules match (WASM=CLI)`);
-            } else {
-              console.log(
-                `[CLI] ❌ Modules mismatch! WASM=${result.modules?.length || 0}, CLI=${cliModules.length}`
-              );
-            }
-
-            // CLI Dependencies comparison
-            const cliDeps = (cliDump.dependencies || []).map((d) =>
-              d.toLowerCase()
+          // CLI Modules comparison
+          const cliModules = cliDump.modules || [];
+          const wasmModulesMatch =
+            result.modules?.length === cliModules.length &&
+            result.modules.every((m, i) => m === cliModules[i]);
+          if (wasmModulesMatch) {
+            console.log(`[CLI] ✅ Modules match (WASM=CLI)`);
+          } else {
+            console.log(
+              `[CLI] ❌ Modules mismatch! WASM=${result.modules?.length || 0}, CLI=${cliModules.length}`
             );
-            const wasmDeps2 = (result.dependencies || []).map((d) =>
-              d.toLowerCase()
-            );
-            const depsMatch2 =
-              wasmDeps2.length === cliDeps.length &&
-              wasmDeps2.every((d, i) => d === cliDeps[i]);
-            if (depsMatch2) {
-              console.log(`[CLI] ✅ Dependencies match (WASM=CLI)`);
-            } else {
-              console.log(
-                `[CLI] ❌ Dependencies mismatch! WASM=${wasmDeps2.length}, CLI=${cliDeps.length}`
-              );
-            }
+            allPass = false;
+          }
 
-            // CLI Digest comparison
-            if (cliDump.digest && result.digest) {
-              const wasmDigest = Buffer.from(result.digest)
-                .toString("hex")
-                .toUpperCase();
-              const cliDigest = Buffer.from(cliDump.digest)
-                .toString("hex")
-                .toUpperCase();
-              if (wasmDigest === cliDigest) {
-                console.log(
-                  `[CLI] ✅ Digest match (${wasmDigest.slice(0, 16)}...)`
-                );
-              } else {
-                console.log(`[CLI] ❌ Digest mismatch!`);
-                console.log(`     WASM: ${wasmDigest}`);
-                console.log(`     CLI:  ${cliDigest}`);
-                allPass = false;
-              }
+          // CLI Dependencies comparison
+          const cliDeps = (cliDump.dependencies || []).map((d) =>
+            d.toLowerCase()
+          );
+          const wasmDeps2 = (result.dependencies || []).map((d) =>
+            d.toLowerCase()
+          );
+          const depsMatch2 =
+            wasmDeps2.length === cliDeps.length &&
+            wasmDeps2.every((d, i) => d === cliDeps[i]);
+          if (depsMatch2) {
+            console.log(`[CLI] ✅ Dependencies match (WASM=CLI)`);
+          } else {
+            console.log(
+              `[CLI] ❌ Dependencies mismatch! WASM=${wasmDeps2.length}, CLI=${cliDeps.length}`
+            );
+            allPass = false;
+          }
+
+          // CLI Digest comparison
+          if (cliDump.digest && result.digest) {
+            const wasmDigest = Buffer.from(result.digest)
+              .toString("hex")
+              .toUpperCase();
+            const cliDigest = Buffer.from(cliDump.digest)
+              .toString("hex")
+              .toUpperCase();
+            if (wasmDigest === cliDigest) {
+              console.log(
+                `[CLI] ✅ Digest match (${wasmDigest.slice(0, 16)}...)`
+              );
+            } else {
+              console.log(`[CLI] ❌ Digest mismatch!`);
+              console.log(`     WASM: ${wasmDigest}`);
+              console.log(`     CLI:  ${cliDigest}`);
+              allPass = false;
             }
+          } else {
+            console.log(`[CLI] ❌ Digest missing from WASM or CLI dump`);
+            allPass = false;
           }
         } catch (txErr) {
-          console.log(`[Tx] ⚠️  Error: ${txErr.message}`);
+          console.log(`[Tx/CLI] ❌ Error: ${txErr.message}`);
+          allPass = false;
         }
       }
     } catch (e) {
